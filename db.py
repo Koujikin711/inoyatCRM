@@ -27,6 +27,17 @@ class Database:
             reject_reason TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         self.conn.commit()
+        self._migrate_users_last_lead_at()
+
+    def _migrate_users_last_lead_at(self):
+        """Добавить колонку last_lead_at в users, если её нет (старая БД на Amvera)."""
+        self.cur.execute("PRAGMA table_info(users)")
+        columns = [row[1] for row in self.cur.fetchall()]
+        if "last_lead_at" not in columns:
+            self.cur.execute(
+                "ALTER TABLE users ADD COLUMN last_lead_at TIMESTAMP DEFAULT '2000-01-01 00:00:00'"
+            )
+            self.conn.commit()
 
     def get_next_manager(self):
         """Алгоритм очереди: берем того, кто дольше всех не получал лид"""
