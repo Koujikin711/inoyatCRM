@@ -73,23 +73,54 @@ async def _process_incoming_wa_message(body: dict) -> bool:
         if target_manager:
             db.cur.execute("INSERT INTO leads (client_phone, manager_id) VALUES (?, ?)", (chat_id, target_manager))
             db.conn.commit()
+    cap_base = f"{prefix}\n📱 Номер: +{chat_id}"
+    file_info = _get_wa_file_info(body)
     if target_manager:
-        msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}"
         try:
-            await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
+            if file_info:
+                ftype, url, fcap = file_info
+                caption = cap_base + (f"\n📝: {fcap}" if fcap else "")
+                if ftype == "imageMessage":
+                    await bot.send_photo(target_manager, photo=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
+                elif ftype == "videoMessage":
+                    await bot.send_video(target_manager, video=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
+                elif ftype == "audioMessage":
+                    await bot.send_voice(target_manager, voice=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
+                elif ftype == "documentMessage":
+                    await bot.send_document(target_manager, document=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
+                else:
+                    await bot.send_message(target_manager, cap_base + f"\n📝: {text}", reply_markup=kb.lead_card_kb(chat_id))
+            else:
+                msg = f"{cap_base}\n📝: {text}"
+                await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
             print(f"--- WA: отправлено менеджеру {target_manager} ---")
         except Exception as send_err:
             print(f"--- WA: ошибка отправки менеджеру {target_manager}: {send_err} ---")
             try:
-                await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{msg[:200]}")
+                await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{cap_base[:100]}...")
             except Exception:
                 pass
     else:
-        msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
+        cap_base = f"{prefix}\n📱 Номер: +{chat_id}"
+        msg = f"{cap_base}\n📝: {text}\n⚠️ Нет активных менеджеров."
         print(f"--- WA: нет активных менеджеров, отправляю владельцу {OWNER_ID} ---")
         sys.stdout.flush()
         try:
-            await bot.send_message(OWNER_ID, msg)
+            if file_info:
+                ftype, url, fcap = file_info
+                caption = cap_base + (f"\n📝: {fcap}" if fcap else "") + "\n⚠️ Нет активных менеджеров."
+                if ftype == "imageMessage":
+                    await bot.send_photo(OWNER_ID, photo=url, caption=caption)
+                elif ftype == "videoMessage":
+                    await bot.send_video(OWNER_ID, video=url, caption=caption)
+                elif ftype == "audioMessage":
+                    await bot.send_voice(OWNER_ID, voice=url, caption=caption)
+                elif ftype == "documentMessage":
+                    await bot.send_document(OWNER_ID, document=url, caption=caption)
+                else:
+                    await bot.send_message(OWNER_ID, msg)
+            else:
+                await bot.send_message(OWNER_ID, msg)
             print("--- WA: отправлено владельцу ---")
         except Exception as send_err:
             print(f"--- WA: ошибка отправки владельцу: {send_err} ---")
@@ -180,6 +211,36 @@ def _normalize_phone(chat_id: str) -> str:
     if len(digits) == 10 and digits.startswith("9"):
         digits = "7" + digits
     return digits
+
+def _get_wa_file_info(body: dict):
+    """Если входящее — фото/видео/аудио/документ, возвращает (typeMessage, downloadUrl, caption). Иначе None."""
+    md = body.get("messageData") or {}
+    fmd = md.get("fileMessageData") or {}
+    url = fmd.get("downloadUrl")
+    t = md.get("typeMessage") or fmd.get("typeMessage")
+    if not url:
+        for key, msg_type in (
+            ("imageMessageData", "imageMessage"),
+            ("videoMessageData", "videoMessage"),
+            ("documentMessageData", "documentMessage"),
+            ("audioMessageData", "audioMessage"),
+        ):
+            block = md.get(key) or {}
+            u = block.get("downloadUrl")
+            if u:
+                url = u
+                t = msg_type
+                break
+    if not url:
+        return None
+    if t not in ("imageMessage", "videoMessage", "audioMessage", "documentMessage"):
+        t = "imageMessage"
+    caption = (fmd.get("caption") or "").strip() or None
+    if caption is None and md.get("imageMessageData"):
+        caption = (md["imageMessageData"].get("caption") or "").strip() or None
+    if caption is None and md.get("videoMessageData"):
+        caption = (md["videoMessageData"].get("caption") or "").strip() or None
+    return (t, url, caption)
 
 def _extract_text_from_message(data: dict) -> str:
     """Достать текст из messageData (текст, расширенный текст, иначе — подпись к медиа или метка)."""
