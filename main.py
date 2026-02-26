@@ -1,6 +1,9 @@
 import asyncio
+import json
 import os
+import re
 import tempfile
+import traceback
 import requests
 import pandas as pd
 from datetime import datetime
@@ -34,34 +37,89 @@ class Form(StatesGroup):
     analytics_period = State()
 
 # --- WEBHOOK ПРИЕМ СООБЩЕНИЙ ---
+def _normalize_phone(chat_id: str) -> str:
+    """Нормализация номера для единого поиска в БД (8XXXXXXXXXX и 7XXXXXXXXXX)."""
+    digits = re.sub(r"\D", "", chat_id)
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return digits or chat_id
+
+def _extract_text_from_message(data: dict) -> str:
+    """Достать текст из messageData (текст, расширенный текст, иначе — подпись к медиа или метка)."""
+    md = data.get("messageData") or {}
+    # Обычное текстовое сообщение
+    try:
+        t = md.get("textMessageData", {}) or {}
+        if isinstance(t.get("textMessage"), str):
+            return t["textMessage"]
+    except Exception:
+        pass
+    # Текст с ссылкой (extendedTextMessageData)
+    try:
+        e = md.get("extendedTextMessageData", {}) or {}
+        if isinstance(e.get("text"), str):
+            return e["text"]
+    except Exception:
+        pass
+    # Медиа с подписью
+    for key in ("imageMessageData", "videoMessageData", "documentMessageData", "audioMessageData"):
+        block = md.get(key) or {}
+        if isinstance(block.get("caption"), str):
+            return block["caption"]
+    # Реакция, стикер и т.д.
+    if md.get("reactionMessageData"):
+        return "[реакция]"
+    if md.get("stickerMessageData"):
+        return "[стикер]"
+    return "[медиа]"
+
 async def handle_webhook(request):
     try:
-        data = await request.json()
-        # Эта строка ПРИНУДИТЕЛЬНО выведет данные в логи Amvera
+        body = await request.read()
+        if not body:
+            print("--- WEBHOOK: пустое тело запроса ---")
+            return web.Response(text="OK", status=200)
+        try:
+            data = body.decode("utf-8") if isinstance(body, bytes) else body
+            if isinstance(data, str):
+                data = json.loads(data)
+        except Exception as e:
+            print(f"--- WEBHOOK: не JSON, ошибка {e} ---")
+            return web.Response(text="OK", status=200)
         print(f"--- ВХОДЯЩИЙ ЗАПРОС ИЗ WA: {data} ---")
         
-        if data.get('typeWebhook') == 'incomingMessageReceived':
-            chat_id = data['senderData']['chatId'].split('@')[0]
-            text = data['messageData']['textMessageData']['textMessage']
-            
-            db.cur.execute("SELECT manager_id FROM leads WHERE client_phone=? LIMIT 1", (chat_id,))
-            res = db.cur.fetchone()
-            
-            if res:
-                target_manager = res[0]
-                prefix = "📩 Сообщение"
-            else:
-                target_manager = db.get_next_manager()
-                prefix = "🔥 НОВЫЙ ЛИД"
-                if target_manager:
-                    db.cur.execute("INSERT INTO leads (client_phone, manager_id) VALUES (?, ?)", (chat_id, target_manager))
-                    db.conn.commit()
-
+        if data.get("typeWebhook") != "incomingMessageReceived":
+            print(f"--- WEBHOOK: пропуск, typeWebhook={data.get('typeWebhook')} ---")
+            return web.Response(text="OK", status=200)
+        
+        sender_data = data.get("senderData") or {}
+        raw_chat_id = (sender_data.get("chatId") or "").split("@")[0].strip()
+        chat_id = _normalize_phone(raw_chat_id)
+        text = _extract_text_from_message(data)
+        
+        db.cur.execute("SELECT manager_id FROM leads WHERE client_phone=? LIMIT 1", (chat_id,))
+        res = db.cur.fetchone()
+        if res:
+            target_manager = res[0]
+            prefix = "📩 Сообщение"
+        else:
+            target_manager = db.get_next_manager()
+            prefix = "🔥 НОВЫЙ ЛИД"
             if target_manager:
-                msg = f"{prefix}\n📱 Номер: {chat_id}\n📝: {text}"
-                await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
+                db.cur.execute("INSERT INTO leads (client_phone, manager_id) VALUES (?, ?)", (chat_id, target_manager))
+                db.conn.commit()
+        
+        if target_manager:
+            msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}"
+            await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
+            print(f"--- WEBHOOK: отправлено менеджеру {target_manager} ---")
+        else:
+            msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
+            await bot.send_message(OWNER_ID, msg)
+            print("--- WEBHOOK: нет менеджеров, уведомление владельцу ---")
     except Exception as e:
-        print(f"Ошибка в вебхуке: {e}")
+        print(f"--- Ошибка в вебхуке: {e} ---")
+        traceback.print_exc()
     
     return web.Response(text="OK", status=200)
 
