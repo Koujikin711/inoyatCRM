@@ -47,6 +47,7 @@ _green_session: ClientSession = None
 async def _process_incoming_wa_message(body: dict) -> bool:
     """Обработать одно входящее сообщение из WA (из вебхука или receiveNotification). Возвращает True если обработано."""
     if db is None or bot is None:
+        print("--- WA: пропуск, бот или БД не инициализированы ---")
         return False
     type_wh = (body.get("typeWebhook") or "").strip()
     if type_wh.lower() not in ("incomingmessagereceived", "incomingfilemessagereceived"):
@@ -55,6 +56,8 @@ async def _process_incoming_wa_message(body: dict) -> bool:
     raw_chat_id = (sender_data.get("chatId") or "").split("@")[0].strip()
     chat_id = _normalize_phone(raw_chat_id)
     text = _extract_text_from_message(body)
+    print(f"--- WA: обрабатываю сообщение от +{chat_id}, текст: {text[:50]!r}... ---")
+    sys.stdout.flush()
     db.cur.execute(
         "SELECT manager_id FROM leads WHERE client_phone=? ORDER BY created_at DESC LIMIT 1",
         (chat_id,)
@@ -82,9 +85,11 @@ async def _process_incoming_wa_message(body: dict) -> bool:
                 pass
     else:
         msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
+        print(f"--- WA: нет активных менеджеров, отправляю владельцу {OWNER_ID} ---")
+        sys.stdout.flush()
         try:
             await bot.send_message(OWNER_ID, msg)
-            print("--- WA: нет менеджеров, уведомление владельцу ---")
+            print("--- WA: отправлено владельцу ---")
         except Exception as send_err:
             print(f"--- WA: ошибка отправки владельцу: {send_err} ---")
     return True
@@ -95,8 +100,13 @@ async def check_wa_polling():
     global _green_session
     receive_url = f"{GREEN_URL}/waInstance{GREEN_ID}/receiveNotification/{GREEN_TOKEN}"
     delete_url = f"{GREEN_URL}/waInstance{GREEN_ID}/deleteNotification/{GREEN_TOKEN}"
+    loop_count = 0
     while True:
         try:
+            loop_count += 1
+            if loop_count % 120 == 1 and loop_count > 1:
+                print("--- WA polling: работаю, жду сообщений из Green API... ---")
+                sys.stdout.flush()
             if not _green_session or _green_session.closed:
                 await asyncio.sleep(2)
                 continue
@@ -105,11 +115,15 @@ async def check_wa_polling():
                 continue
             async with _green_session.get(receive_url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
                 if resp.status != 200:
+                    if loop_count % 30 == 1:
+                        print(f"--- WA polling: HTTP {resp.status} ---")
+                        sys.stdout.flush()
                     await asyncio.sleep(1)
                     continue
                 try:
                     j = await resp.json()
-                except Exception:
+                except Exception as e:
+                    print(f"--- WA polling: ответ не JSON: {e} ---")
                     await asyncio.sleep(1)
                     continue
             if not j:
@@ -117,6 +131,18 @@ async def check_wa_polling():
                 continue
             rid = j.get("receiptId")
             body = j.get("body") or {}
+            type_wh = (body.get("typeWebhook") or "").strip()
+            print(f"--- WA polling: уведомление typeWebhook={type_wh!r}, receiptId={rid} ---")
+            sys.stdout.flush()
+            if type_wh.lower() not in ("incomingmessagereceived", "incomingfilemessagereceived"):
+                if rid:
+                    try:
+                        async with _green_session.delete(f"{delete_url}/{rid}", timeout=aiohttp.ClientTimeout(total=10)) as _:
+                            pass
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.3)
+                continue
             try:
                 await _process_incoming_wa_message(body)
             except Exception as e:
