@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import tempfile
 import traceback
 import requests
@@ -84,6 +85,7 @@ async def handle_webhook(request):
     try:
         body = await request.read()
         print(f"--- WEBHOOK POST получен, размер тела: {len(body) if body else 0} ---")
+        sys.stdout.flush()
         if not body:
             return web.Response(text="OK", status=200)
         try:
@@ -94,6 +96,7 @@ async def handle_webhook(request):
             print(f"--- WEBHOOK: не JSON, ошибка {e} ---")
             return web.Response(text="OK", status=200)
         print(f"--- ВХОДЯЩИЙ ЗАПРОС ИЗ WA: {data} ---")
+        sys.stdout.flush()
         
         type_wh = (data.get("typeWebhook") or "").strip()
         if type_wh.lower() != "incomingmessagereceived":
@@ -496,18 +499,21 @@ async def start_bot():
     await dp.start_polling(bot)
 
 async def main():
+    print("CRM ИНОЯТА: запуск приложения...")
+    sys.stdout.flush()
     # Создаем веб-приложение
     app = web.Application()
     app.router.add_post('/webhook', handle_webhook)
-    # Добавим GET, чтобы ты мог проверить в браузере
+    # GET — проверка в браузере: открыть URL /webhook
     app.router.add_get('/webhook', lambda r: web.Response(text="Webhook is working! Send POST request."))
     
     runner = web.AppRunner(app)
     await runner.setup()
-    # Порт 80 для Amvera
-    site = web.TCPSite(runner, '0.0.0.0', 80)
+    port = int(os.environ.get("PORT", 80))
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print("Веб-сервер запущен на порту 80. Путь: /webhook")
+    print(f"Веб-сервер запущен на порту {port}. Путь: /webhook")
+    sys.stdout.flush()
     
     # Запускаем бота
     await start_bot()
