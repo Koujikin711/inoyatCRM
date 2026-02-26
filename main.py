@@ -26,9 +26,9 @@ GREEN_ID = "7103530127"
 GREEN_TOKEN = "fd8a594875de4d378f56426f27abe1ebc1a79ae12f6d42e29b"
 OWNER_ID = 1583163832 
 
-bot = Bot(token=TOKEN)
+bot = None
 dp = Dispatcher()
-db = Database("/data/marketing_crm.db")
+db = None
 
 class Form(StatesGroup):
     waiting_for_fio = State()
@@ -103,6 +103,11 @@ async def handle_webhook(request):
             print(f"--- WEBHOOK: пропуск, typeWebhook={type_wh} ---")
             return web.Response(text="OK", status=200)
         
+        if db is None or bot is None:
+            print("--- WEBHOOK: пропуск, БД или бот не инициализированы ---")
+            sys.stdout.flush()
+            return web.Response(text="OK", status=200)
+        
         sender_data = data.get("senderData") or {}
         raw_chat_id = (sender_data.get("chatId") or "").split("@")[0].strip()
         chat_id = _normalize_phone(raw_chat_id)
@@ -132,13 +137,15 @@ async def handle_webhook(request):
             except Exception as send_err:
                 print(f"--- WEBHOOK: ошибка отправки менеджеру {target_manager}: {send_err} ---")
                 try:
-                    await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{msg[:200]}")
+                    if bot:
+                        await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{msg[:200]}")
                 except Exception:
                     pass
         else:
             msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
             try:
-                await bot.send_message(OWNER_ID, msg)
+                if bot:
+                    await bot.send_message(OWNER_ID, msg)
                 print("--- WEBHOOK: нет менеджеров, уведомление владельцу ---")
             except Exception as send_err:
                 print(f"--- WEBHOOK: ошибка отправки владельцу: {send_err} ---")
@@ -499,24 +506,47 @@ async def start_bot():
     await dp.start_polling(bot)
 
 async def main():
+    global bot, db
     print("CRM ИНОЯТА: запуск приложения...")
     sys.stdout.flush()
-    # Создаем веб-приложение
+    
+    try:
+        db = Database("/data/marketing_crm.db")
+        print("БД инициализирована: /data/marketing_crm.db")
+    except Exception as e:
+        print(f"Ошибка БД: {e}")
+        traceback.print_exc()
+        db = None
+    sys.stdout.flush()
+    
+    try:
+        bot = Bot(token=TOKEN)
+        print("Бот инициализирован")
+    except Exception as e:
+        print(f"Ошибка бота: {e}")
+        traceback.print_exc()
+        bot = None
+    sys.stdout.flush()
+    
     app = web.Application()
-    app.router.add_post('/webhook', handle_webhook)
-    # GET — проверка в браузере: открыть URL /webhook
-    app.router.add_get('/webhook', lambda r: web.Response(text="Webhook is working! Send POST request."))
+    app.router.add_get("/", lambda r: web.Response(text="CRM ИНОЯТА OK"))
+    app.router.add_get("/ping", lambda r: web.Response(text="pong"))
+    app.router.add_post("/webhook", handle_webhook)
+    app.router.add_get("/webhook", lambda r: web.Response(text="Webhook is working! Send POST request."))
     
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 80))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"Веб-сервер запущен на порту {port}. Путь: /webhook")
     sys.stdout.flush()
     
-    # Запускаем бота
-    await start_bot()
+    if bot:
+        await start_bot()
+    else:
+        print("Бот не запущен — работают только вебхуки. Ожидание...")
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
