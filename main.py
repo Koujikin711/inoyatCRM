@@ -9,6 +9,7 @@ import requests
 import pandas as pd
 from datetime import datetime
 from aiohttp import web, ClientSession
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
@@ -40,6 +41,100 @@ class Form(StatesGroup):
     analytics_period = State()
 
 # --- WEBHOOK ПРИЕМ СООБЩЕНИЙ ---
+# Общая сессия для запросов к Green API (опрос уведомлений)
+_green_session: ClientSession = None
+
+async def _process_incoming_wa_message(body: dict) -> bool:
+    """Обработать одно входящее сообщение из WA (из вебхука или receiveNotification). Возвращает True если обработано."""
+    if db is None or bot is None:
+        return False
+    type_wh = (body.get("typeWebhook") or "").strip()
+    if type_wh.lower() not in ("incomingmessagereceived", "incomingfilemessagereceived"):
+        return False
+    sender_data = body.get("senderData") or {}
+    raw_chat_id = (sender_data.get("chatId") or "").split("@")[0].strip()
+    chat_id = _normalize_phone(raw_chat_id)
+    text = _extract_text_from_message(body)
+    db.cur.execute(
+        "SELECT manager_id FROM leads WHERE client_phone=? ORDER BY created_at DESC LIMIT 1",
+        (chat_id,)
+    )
+    res = db.cur.fetchone()
+    if res:
+        target_manager = res[0]
+        prefix = "📩 Сообщение"
+    else:
+        target_manager = db.get_next_manager()
+        prefix = "🔥 НОВЫЙ ЛИД"
+        if target_manager:
+            db.cur.execute("INSERT INTO leads (client_phone, manager_id) VALUES (?, ?)", (chat_id, target_manager))
+            db.conn.commit()
+    if target_manager:
+        msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}"
+        try:
+            await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
+            print(f"--- WA: отправлено менеджеру {target_manager} ---")
+        except Exception as send_err:
+            print(f"--- WA: ошибка отправки менеджеру {target_manager}: {send_err} ---")
+            try:
+                await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{msg[:200]}")
+            except Exception:
+                pass
+    else:
+        msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
+        try:
+            await bot.send_message(OWNER_ID, msg)
+            print("--- WA: нет менеджеров, уведомление владельцу ---")
+        except Exception as send_err:
+            print(f"--- WA: ошибка отправки владельцу: {send_err} ---")
+    return True
+
+# --- ОПРОС GREEN API (receiveNotification) — как в рабочем CRM, без вебхука ---
+async def check_wa_polling():
+    """Фоновая задача: опрашивать receiveNotification и обрабатывать входящие сообщения."""
+    global _green_session
+    receive_url = f"{GREEN_URL}/waInstance{GREEN_ID}/receiveNotification/{GREEN_TOKEN}"
+    delete_url = f"{GREEN_URL}/waInstance{GREEN_ID}/deleteNotification/{GREEN_TOKEN}"
+    while True:
+        try:
+            if not _green_session or _green_session.closed:
+                await asyncio.sleep(2)
+                continue
+            if db is None or bot is None:
+                await asyncio.sleep(2)
+                continue
+            async with _green_session.get(receive_url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                if resp.status != 200:
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    j = await resp.json()
+                except Exception:
+                    await asyncio.sleep(1)
+                    continue
+            if not j:
+                await asyncio.sleep(1)
+                continue
+            rid = j.get("receiptId")
+            body = j.get("body") or {}
+            try:
+                await _process_incoming_wa_message(body)
+            except Exception as e:
+                print(f"--- WA polling: ошибка обработки: {e} ---")
+                traceback.print_exc()
+            if rid:
+                try:
+                    async with _green_session.delete(f"{delete_url}/{rid}", timeout=aiohttp.ClientTimeout(total=10)) as _:
+                        pass
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3)
+        except asyncio.TimeoutError:
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"--- WA polling: {e} ---")
+            await asyncio.sleep(2)
+
 def _normalize_phone(chat_id: str) -> str:
     """Нормализация номера для единого поиска в БД (8/7XXXXXXXXXX, 9XXXXXXXXX)."""
     digits = re.sub(r"\D", "", str(chat_id))
@@ -108,47 +203,7 @@ async def handle_webhook(request):
             sys.stdout.flush()
             return web.Response(text="OK", status=200)
         
-        sender_data = data.get("senderData") or {}
-        raw_chat_id = (sender_data.get("chatId") or "").split("@")[0].strip()
-        chat_id = _normalize_phone(raw_chat_id)
-        text = _extract_text_from_message(data)
-        
-        # Сначала ищем активный лид по этому номеру, иначе — последний лид (действующий чат)
-        db.cur.execute(
-            "SELECT manager_id FROM leads WHERE client_phone=? ORDER BY created_at DESC LIMIT 1",
-            (chat_id,)
-        )
-        res = db.cur.fetchone()
-        if res:
-            target_manager = res[0]
-            prefix = "📩 Сообщение"
-        else:
-            target_manager = db.get_next_manager()
-            prefix = "🔥 НОВЫЙ ЛИД"
-            if target_manager:
-                db.cur.execute("INSERT INTO leads (client_phone, manager_id) VALUES (?, ?)", (chat_id, target_manager))
-                db.conn.commit()
-        
-        if target_manager:
-            msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}"
-            try:
-                await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
-                print(f"--- WEBHOOK: отправлено менеджеру {target_manager} ---")
-            except Exception as send_err:
-                print(f"--- WEBHOOK: ошибка отправки менеджеру {target_manager}: {send_err} ---")
-                try:
-                    if bot:
-                        await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{msg[:200]}")
-                except Exception:
-                    pass
-        else:
-            msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
-            try:
-                if bot:
-                    await bot.send_message(OWNER_ID, msg)
-                print("--- WEBHOOK: нет менеджеров, уведомление владельцу ---")
-            except Exception as send_err:
-                print(f"--- WEBHOOK: ошибка отправки владельцу: {send_err} ---")
+        await _process_incoming_wa_message(data)
     except Exception as e:
         print(f"--- Ошибка в вебхуке: {e} ---")
         traceback.print_exc()
@@ -506,7 +561,7 @@ async def start_bot():
     await dp.start_polling(bot)
 
 async def main():
-    global bot, db
+    global bot, db, _green_session
     print("CRM ИНОЯТА: запуск приложения...")
     sys.stdout.flush()
     
@@ -526,6 +581,11 @@ async def main():
         print(f"Ошибка бота: {e}")
         traceback.print_exc()
         bot = None
+    sys.stdout.flush()
+    
+    _green_session = ClientSession()
+    asyncio.create_task(check_wa_polling())
+    print("Опрос Green API (receiveNotification) запущен — сообщения из WA будут приходить без вебхука.")
     sys.stdout.flush()
     
     app = web.Application()
