@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import traceback
 import requests
 import pandas as pd
@@ -101,11 +102,14 @@ async def check_wa_polling():
     receive_url = f"{GREEN_URL}/waInstance{GREEN_ID}/receiveNotification/{GREEN_TOKEN}"
     delete_url = f"{GREEN_URL}/waInstance{GREEN_ID}/deleteNotification/{GREEN_TOKEN}"
     loop_count = 0
+    last_heartbeat = 0
     while True:
         try:
             loop_count += 1
-            if loop_count % 120 == 1 and loop_count > 1:
-                print("--- WA polling: работаю, жду сообщений из Green API... ---")
+            now = time.monotonic()
+            if now - last_heartbeat >= 15:
+                last_heartbeat = now
+                print("--- WA polling: работаю, жду сообщений из Green API (receiveNotification). Отправь сообщение в WhatsApp. ---")
                 sys.stdout.flush()
             if not _green_session or _green_session.closed:
                 await asyncio.sleep(2)
@@ -115,18 +119,21 @@ async def check_wa_polling():
                 continue
             async with _green_session.get(receive_url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
                 if resp.status != 200:
-                    if loop_count % 30 == 1:
-                        print(f"--- WA polling: HTTP {resp.status} ---")
-                        sys.stdout.flush()
+                    print(f"--- WA polling: HTTP {resp.status} (ожидаем 200) ---")
+                    sys.stdout.flush()
                     await asyncio.sleep(1)
                     continue
                 try:
                     j = await resp.json()
                 except Exception as e:
                     print(f"--- WA polling: ответ не JSON: {e} ---")
+                    sys.stdout.flush()
                     await asyncio.sleep(1)
                     continue
             if not j:
+                if loop_count % 20 == 0:
+                    print("--- WA polling: пустой ответ от Green API. Включи в консоли Green API приём по HTTP API и выключи вебхук. ---")
+                    sys.stdout.flush()
                 await asyncio.sleep(1)
                 continue
             rid = j.get("receiptId")
