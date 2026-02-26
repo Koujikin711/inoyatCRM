@@ -18,7 +18,7 @@ import kb
 
 # --- КОНФИГУРАЦИЯ ---
 # CRM ИНОЯТА — Telegram + WhatsApp (Green API)
-# Деплой по push в GitHub
+# Деплой по push в GitHub (webhook)
 TOKEN = "8634696282:AAEBajKKapvJpsLZx649GyUX9kCh5jThWHM"
 GREEN_URL = "https://7103.api.greenapi.com"
 GREEN_ID = "7103530127"
