@@ -40,11 +40,15 @@ class Form(StatesGroup):
 
 # --- WEBHOOK ПРИЕМ СООБЩЕНИЙ ---
 def _normalize_phone(chat_id: str) -> str:
-    """Нормализация номера для единого поиска в БД (8XXXXXXXXXX и 7XXXXXXXXXX)."""
-    digits = re.sub(r"\D", "", chat_id)
+    """Нормализация номера для единого поиска в БД (8/7XXXXXXXXXX, 9XXXXXXXXX)."""
+    digits = re.sub(r"\D", "", str(chat_id))
+    if not digits:
+        return (chat_id or "").strip()
     if len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
-    return digits or chat_id
+    if len(digits) == 10 and digits.startswith("9"):
+        digits = "7" + digits
+    return digits
 
 def _extract_text_from_message(data: dict) -> str:
     """Достать текст из messageData (текст, расширенный текст, иначе — подпись к медиа или метка)."""
@@ -76,10 +80,11 @@ def _extract_text_from_message(data: dict) -> str:
     return "[медиа]"
 
 async def handle_webhook(request):
+    # Сразу отвечаем 200, чтобы Green API не повторял запрос
     try:
         body = await request.read()
+        print(f"--- WEBHOOK POST получен, размер тела: {len(body) if body else 0} ---")
         if not body:
-            print("--- WEBHOOK: пустое тело запроса ---")
             return web.Response(text="OK", status=200)
         try:
             data = body.decode("utf-8") if isinstance(body, bytes) else body
@@ -90,8 +95,9 @@ async def handle_webhook(request):
             return web.Response(text="OK", status=200)
         print(f"--- ВХОДЯЩИЙ ЗАПРОС ИЗ WA: {data} ---")
         
-        if data.get("typeWebhook") != "incomingMessageReceived":
-            print(f"--- WEBHOOK: пропуск, typeWebhook={data.get('typeWebhook')} ---")
+        type_wh = (data.get("typeWebhook") or "").strip()
+        if type_wh.lower() != "incomingmessagereceived":
+            print(f"--- WEBHOOK: пропуск, typeWebhook={type_wh} ---")
             return web.Response(text="OK", status=200)
         
         sender_data = data.get("senderData") or {}
@@ -99,7 +105,11 @@ async def handle_webhook(request):
         chat_id = _normalize_phone(raw_chat_id)
         text = _extract_text_from_message(data)
         
-        db.cur.execute("SELECT manager_id FROM leads WHERE client_phone=? LIMIT 1", (chat_id,))
+        # Сначала ищем активный лид по этому номеру, иначе — последний лид (действующий чат)
+        db.cur.execute(
+            "SELECT manager_id FROM leads WHERE client_phone=? ORDER BY created_at DESC LIMIT 1",
+            (chat_id,)
+        )
         res = db.cur.fetchone()
         if res:
             target_manager = res[0]
@@ -113,12 +123,22 @@ async def handle_webhook(request):
         
         if target_manager:
             msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}"
-            await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
-            print(f"--- WEBHOOK: отправлено менеджеру {target_manager} ---")
+            try:
+                await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
+                print(f"--- WEBHOOK: отправлено менеджеру {target_manager} ---")
+            except Exception as send_err:
+                print(f"--- WEBHOOK: ошибка отправки менеджеру {target_manager}: {send_err} ---")
+                try:
+                    await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{msg[:200]}")
+                except Exception:
+                    pass
         else:
             msg = f"{prefix}\n📱 Номер: +{chat_id}\n📝: {text}\n⚠️ Нет активных менеджеров."
-            await bot.send_message(OWNER_ID, msg)
-            print("--- WEBHOOK: нет менеджеров, уведомление владельцу ---")
+            try:
+                await bot.send_message(OWNER_ID, msg)
+                print("--- WEBHOOK: нет менеджеров, уведомление владельцу ---")
+            except Exception as send_err:
+                print(f"--- WEBHOOK: ошибка отправки владельцу: {send_err} ---")
     except Exception as e:
         print(f"--- Ошибка в вебхуке: {e} ---")
         traceback.print_exc()
