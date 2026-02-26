@@ -99,6 +99,8 @@ async def _process_incoming_wa_message(body: dict) -> bool:
 async def check_wa_polling():
     """Фоновая задача: опрашивать receiveNotification и обрабатывать входящие сообщения."""
     global _green_session
+    print("--- WA polling: фоновая задача запущена ---")
+    sys.stdout.flush()
     receive_url = f"{GREEN_URL}/waInstance{GREEN_ID}/receiveNotification/{GREEN_TOKEN}"
     delete_url = f"{GREEN_URL}/waInstance{GREEN_ID}/deleteNotification/{GREEN_TOKEN}"
     loop_count = 0
@@ -617,6 +619,20 @@ async def main():
     sys.stdout.flush()
     
     _green_session = ClientSession()
+    # Проверка настроек инстанса Green API (webhookUrl должен быть пустым для опроса)
+    try:
+        url = f"{GREEN_URL}/waInstance{GREEN_ID}/getSettings/{GREEN_TOKEN}"
+        async with _green_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data = await r.json()
+                webhook = (data.get("webhookUrl") or "").strip()
+                inc = data.get("incomingWebhook", "?")
+                print(f"--- Green API getSettings: webhookUrl={webhook!r}, incomingWebhook={inc} ---")
+            else:
+                print(f"--- Green API getSettings: HTTP {r.status} ---")
+    except Exception as e:
+        print(f"--- Green API getSettings: {e} ---")
+    sys.stdout.flush()
     asyncio.create_task(check_wa_polling())
     print("Опрос Green API (receiveNotification) запущен — сообщения из WA будут приходить без вебхука.")
     sys.stdout.flush()
