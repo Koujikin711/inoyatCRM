@@ -246,6 +246,7 @@ async def on_archive_video(message: types.Message):
     caption = message.caption
     parsed = parse_lesson_caption(caption)
     if not parsed:
+        logger.warning("Группа: не распознан формат подписи: %s", (caption or "")[:100])
         return
     lesson_num = parsed["lesson_num"] or await get_next_lesson_num()
     file_id = message.video.file_id
@@ -259,27 +260,29 @@ async def on_archive_video(message: types.Message):
         parsed["option3"],
         parsed["correct_num"],
     )
-    logger.info("Сохранён урок %s: %s", lesson_num, parsed["title"])
+    logger.info("Сохранён урок %s из группы: %s", lesson_num, parsed["title"])
     # Кто уже допущен и ждёт этот урок — сразу получают видео
     sent = await send_lesson_to_waiting_users(lesson_num)
     if sent:
         logger.info("Урок %s отправлен %s пользователям", lesson_num, sent)
 
 
-# --- Админ переслал сообщение из группы в ЛС — тоже парсим и сохраняем урок ---
+# --- Владелец прислал видео в ЛС (с подписью в формате урока) или переслал из группы — сохранить и разослать ждущим ---
 @dp.message(F.chat.id == ADMIN_ID, F.video, F.caption)
-async def on_admin_forwarded_archive(message: types.Message):
-    # Откуда переслано: forward_origin.sender_chat.id (группа/канал) или forward_origin.chat.id
+async def on_admin_video(message: types.Message):
     origin = getattr(message, "forward_origin", None)
-    if not origin:
-        return
-    chat_id = getattr(getattr(origin, "sender_chat", None), "id", None) or getattr(getattr(origin, "chat", None), "id", None)
-    if chat_id != ARCHIVE_GROUP_ID:
-        return
+    if origin is not None:
+        chat_id = getattr(getattr(origin, "sender_chat", None), "id", None) or getattr(getattr(origin, "chat", None), "id", None)
+        if chat_id != ARCHIVE_GROUP_ID:
+            return
     caption = message.caption
     parsed = parse_lesson_caption(caption)
     if not parsed:
-        await message.reply("Неверный формат подписи. Нужно: Заголовок | Вопрос | Вариант1, Вариант2, Вариант3 | 1-3")
+        await message.reply(
+            "Неверный формат подписи. Нужно:\n"
+            "Заголовок | Вопрос | Вариант1, Вариант2, Вариант3 | 1-3\n"
+            "Например: Урок 1. Введение | Что такое X? | Да, Нет, Не знаю | 2"
+        )
         return
     lesson_num = parsed["lesson_num"] or await get_next_lesson_num()
     file_id = message.video.file_id
@@ -294,10 +297,11 @@ async def on_admin_forwarded_archive(message: types.Message):
         parsed["correct_num"],
     )
     await message.reply(f"Урок {lesson_num} сохранён: {parsed['title']}")
-    # Кто уже допущен и ждёт этот урок — сразу получают видео
     sent = await send_lesson_to_waiting_users(lesson_num)
     if sent:
-        await message.reply(f"Видео отправлено {sent} пользователям, которые ждали этот урок.")
+        await message.reply(f"Видео отправлено {sent} пользователям, которые ждут этот урок.")
+    else:
+        await message.reply("Ждущих этот урок пока нет.")
 
 
 # --- Админ: /admin или кнопка «Статистика» ---
