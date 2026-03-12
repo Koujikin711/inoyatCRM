@@ -444,6 +444,7 @@ async def quiz_answer(cb: CallbackQuery):
 # --- Точка входа ---
 async def main():
     await init_db()
+    logger.info("ADMIN_ID=%s (владелец получает заявки и /admin)", ADMIN_ID)
     scheduler.add_job(job_24h, "interval", minutes=1)
     scheduler.start()
     try:
