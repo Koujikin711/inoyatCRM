@@ -1,725 +1,452 @@
+# -*- coding: utf-8 -*-
+"""
+Обучающая платформа для учеников + CRM для админа.
+Регистрация (ФИ) -> модерация -> уроки из группы-архива, через 24ч викторина.
+aiogram 3.x, aiosqlite, APScheduler.
+"""
+
 import asyncio
-import json
-import os
+import logging
 import re
-import sys
-import tempfile
-import time
-import traceback
-import requests
-import pandas as pd
 from datetime import datetime
-from aiohttp import web, ClientSession
-import aiohttp
+
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from db import Database
-import kb
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- КОНФИГУРАЦИЯ ---
-# CRM ИНОЯТА — Telegram + WhatsApp (Green API)
-# Деплой по push в GitHub (webhook)
-TOKEN = "8634696282:AAEBajKKapvJpsLZx649GyUX9kCh5jThWHM"
-GREEN_URL = "https://7103.api.greenapi.com"
-GREEN_ID = "7103530127"
-GREEN_TOKEN = "fd8a594875de4d378f56426f27abe1ebc1a79ae12f6d42e29b"
-OWNER_ID = 1583163832 
+from config import ADMIN_ID, ARCHIVE_GROUP_ID, BOT_TOKEN, DB_PATH, QUIZ_AFTER_MINUTES
+from database import (
+    add_user_pending,
+    advance_user_lesson,
+    delete_video_sent_record,
+    get_active_users_for_lesson,
+    get_all_users,
+    get_due_video_sends,
+    get_lesson,
+    get_next_lesson_num,
+    get_stats_by_lesson,
+    get_user,
+    init_db,
+    save_lesson,
+    save_video_sent,
+    set_user_status,
+)
 
-bot = None
-dp = Dispatcher()
-db = None
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class Form(StatesGroup):
-    waiting_for_fio = State()
-    writing_answer = State()
-    finish_paid_total = State()
-    finish_paid_amount = State()
-    finish_reject = State()
-    pay_lead_amount = State()
-    analytics_period = State()
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+scheduler = AsyncIOScheduler()
 
-# --- WEBHOOK ПРИЕМ СООБЩЕНИЙ ---
-# Общая сессия для запросов к Green API (опрос уведомлений)
-_green_session: ClientSession = None
-
-async def _process_incoming_wa_message(body: dict) -> bool:
-    """Обработать одно входящее сообщение из WA (из вебхука или receiveNotification). Возвращает True если обработано."""
-    if db is None or bot is None:
-        print("--- WA: пропуск, бот или БД не инициализированы ---")
-        return False
-    type_wh = (body.get("typeWebhook") or "").strip()
-    if type_wh.lower() not in ("incomingmessagereceived", "incomingfilemessagereceived"):
-        return False
-    sender_data = body.get("senderData") or {}
-    raw_chat_id = (sender_data.get("chatId") or "").split("@")[0].strip()
-    chat_id = _normalize_phone(raw_chat_id)
-    text = _extract_text_from_message(body)
-    print(f"--- WA: обрабатываю сообщение от +{chat_id}, текст: {text[:50]!r}... ---")
-    sys.stdout.flush()
-    db.cur.execute(
-        "SELECT manager_id FROM leads WHERE client_phone=? ORDER BY created_at DESC LIMIT 1",
-        (chat_id,)
+# Клавиатура владельца: одна кнопка «Статистика»
+def admin_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📊 Статистика")]],
+        resize_keyboard=True,
     )
-    res = db.cur.fetchone()
-    if res:
-        target_manager = res[0]
-        prefix = "📩 Сообщение"
-    else:
-        target_manager = db.get_next_manager()
-        prefix = "🔥 НОВЫЙ ЛИД"
-        if target_manager:
-            db.cur.execute("INSERT INTO leads (client_phone, manager_id) VALUES (?, ?)", (chat_id, target_manager))
-            db.conn.commit()
-    cap_base = f"{prefix}\n📱 Номер: +{chat_id}"
-    file_info = _get_wa_file_info(body)
-    if target_manager:
-        try:
-            if file_info:
-                ftype, url, fcap = file_info
-                caption = cap_base + (f"\n📝: {fcap}" if fcap else "")
-                if ftype == "imageMessage":
-                    await bot.send_photo(target_manager, photo=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
-                elif ftype == "videoMessage":
-                    await bot.send_video(target_manager, video=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
-                elif ftype == "audioMessage":
-                    await bot.send_voice(target_manager, voice=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
-                elif ftype == "documentMessage":
-                    await bot.send_document(target_manager, document=url, caption=caption, reply_markup=kb.lead_card_kb(chat_id))
-                else:
-                    await bot.send_message(target_manager, cap_base + f"\n📝: {text}", reply_markup=kb.lead_card_kb(chat_id))
-            else:
-                msg = f"{cap_base}\n📝: {text}"
-                await bot.send_message(target_manager, msg, reply_markup=kb.lead_card_kb(chat_id))
-            print(f"--- WA: отправлено менеджеру {target_manager} ---")
-        except Exception as send_err:
-            print(f"--- WA: ошибка отправки менеджеру {target_manager}: {send_err} ---")
-            try:
-                await bot.send_message(OWNER_ID, f"⚠️ Не удалось отправить менеджеру {target_manager}:\n{cap_base[:100]}...")
-            except Exception:
-                pass
-    else:
-        cap_base = f"{prefix}\n📱 Номер: +{chat_id}"
-        msg = f"{cap_base}\n📝: {text}\n⚠️ Нет активных менеджеров."
-        print(f"--- WA: нет активных менеджеров, отправляю владельцу {OWNER_ID} ---")
-        sys.stdout.flush()
-        try:
-            if file_info:
-                ftype, url, fcap = file_info
-                caption = cap_base + (f"\n📝: {fcap}" if fcap else "") + "\n⚠️ Нет активных менеджеров."
-                if ftype == "imageMessage":
-                    await bot.send_photo(OWNER_ID, photo=url, caption=caption)
-                elif ftype == "videoMessage":
-                    await bot.send_video(OWNER_ID, video=url, caption=caption)
-                elif ftype == "audioMessage":
-                    await bot.send_voice(OWNER_ID, voice=url, caption=caption)
-                elif ftype == "documentMessage":
-                    await bot.send_document(OWNER_ID, document=url, caption=caption)
-                else:
-                    await bot.send_message(OWNER_ID, msg)
-            else:
-                await bot.send_message(OWNER_ID, msg)
-            print("--- WA: отправлено владельцу ---")
-        except Exception as send_err:
-            print(f"--- WA: ошибка отправки владельцу: {send_err} ---")
-    return True
 
-# --- ОПРОС GREEN API (receiveNotification) — как в рабочем CRM, без вебхука ---
-async def check_wa_polling():
-    """Фоновая задача: опрашивать receiveNotification и обрабатывать входящие сообщения."""
-    global _green_session
-    print("--- WA polling: фоновая задача запущена ---")
-    sys.stdout.flush()
-    receive_url = f"{GREEN_URL}/waInstance{GREEN_ID}/receiveNotification/{GREEN_TOKEN}"
-    delete_url = f"{GREEN_URL}/waInstance{GREEN_ID}/deleteNotification/{GREEN_TOKEN}"
-    loop_count = 0
-    last_heartbeat = 0
-    while True:
-        try:
-            loop_count += 1
-            now = time.monotonic()
-            if now - last_heartbeat >= 15:
-                last_heartbeat = now
-                print("--- WA polling: работаю, жду сообщений из Green API (receiveNotification). Отправь сообщение в WhatsApp. ---")
-                sys.stdout.flush()
-            if not _green_session or _green_session.closed:
-                await asyncio.sleep(2)
-                continue
-            if db is None or bot is None:
-                await asyncio.sleep(2)
-                continue
-            async with _green_session.get(receive_url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                if resp.status != 200:
-                    print(f"--- WA polling: HTTP {resp.status} (ожидаем 200) ---")
-                    sys.stdout.flush()
-                    await asyncio.sleep(1)
-                    continue
-                try:
-                    j = await resp.json()
-                except Exception as e:
-                    print(f"--- WA polling: ответ не JSON: {e} ---")
-                    sys.stdout.flush()
-                    await asyncio.sleep(1)
-                    continue
-            if not j:
-                if loop_count % 20 == 0:
-                    print("--- WA polling: пустой ответ от Green API. Включи в консоли Green API приём по HTTP API и выключи вебхук. ---")
-                    sys.stdout.flush()
-                await asyncio.sleep(1)
-                continue
-            rid = j.get("receiptId")
-            body = j.get("body") or {}
-            type_wh = (body.get("typeWebhook") or "").strip()
-            print(f"--- WA polling: уведомление typeWebhook={type_wh!r}, receiptId={rid} ---")
-            sys.stdout.flush()
-            if type_wh.lower() not in ("incomingmessagereceived", "incomingfilemessagereceived"):
-                if rid:
-                    try:
-                        async with _green_session.delete(f"{delete_url}/{rid}", timeout=aiohttp.ClientTimeout(total=10)) as _:
-                            pass
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.3)
-                continue
-            try:
-                await _process_incoming_wa_message(body)
-            except Exception as e:
-                print(f"--- WA polling: ошибка обработки: {e} ---")
-                traceback.print_exc()
-            if rid:
-                try:
-                    async with _green_session.delete(f"{delete_url}/{rid}", timeout=aiohttp.ClientTimeout(total=10)) as _:
-                        pass
-                except Exception:
-                    pass
-            await asyncio.sleep(0.3)
-        except asyncio.TimeoutError:
-            await asyncio.sleep(1)
-        except Exception as e:
-            print(f"--- WA polling: {e} ---")
-            await asyncio.sleep(2)
 
-def _normalize_phone(chat_id: str) -> str:
-    """Нормализация номера для единого поиска в БД (8/7XXXXXXXXXX, 9XXXXXXXXX)."""
-    digits = re.sub(r"\D", "", str(chat_id))
-    if not digits:
-        return (chat_id or "").strip()
-    if len(digits) == 11 and digits.startswith("8"):
-        digits = "7" + digits[1:]
-    if len(digits) == 10 and digits.startswith("9"):
-        digits = "7" + digits
-    return digits
+# --- FSM для регистрации ---
+class RegStates(StatesGroup):
+    surname = State()
+    name = State()
 
-def _get_wa_file_info(body: dict):
-    """Если входящее — фото/видео/аудио/документ, возвращает (typeMessage, downloadUrl, caption). Иначе None."""
-    md = body.get("messageData") or {}
-    fmd = md.get("fileMessageData") or {}
-    url = fmd.get("downloadUrl")
-    t = md.get("typeMessage") or fmd.get("typeMessage")
-    if not url:
-        for key, msg_type in (
-            ("imageMessageData", "imageMessage"),
-            ("videoMessageData", "videoMessage"),
-            ("documentMessageData", "documentMessage"),
-            ("audioMessageData", "audioMessage"),
-        ):
-            block = md.get(key) or {}
-            u = block.get("downloadUrl")
-            if u:
-                url = u
-                t = msg_type
-                break
-    if not url:
+
+# --- Разбор описания урока из подписи группы ---
+# Формат: Заголовок урока | Вопрос | Вариант1, Вариант2, Вариант3 | Номер_Правильного_Ответа(1-3)
+def parse_lesson_caption(caption: str):
+    if not caption or "|" not in caption:
         return None
-    if t not in ("imageMessage", "videoMessage", "audioMessage", "documentMessage"):
-        t = "imageMessage"
-    caption = (fmd.get("caption") or "").strip() or None
-    if caption is None and md.get("imageMessageData"):
-        caption = (md["imageMessageData"].get("caption") or "").strip() or None
-    if caption is None and md.get("videoMessageData"):
-        caption = (md["videoMessageData"].get("caption") or "").strip() or None
-    return (t, url, caption)
+    parts = [p.strip() for p in caption.split("|")]
+    if len(parts) < 4:
+        return None
+    title = parts[0]
+    question = parts[1]
+    opts_str = parts[2]
+    try:
+        correct_num = int(parts[3].strip())
+        if correct_num not in (1, 2, 3):
+            return None
+    except ValueError:
+        return None
+    options = [o.strip() for o in opts_str.split(",")]
+    if len(options) < 3:
+        return None
+    option1, option2, option3 = options[0], options[1], options[2]
+    # Номер урока из заголовка (Урок 1, Урок 2, ...) или None
+    m = re.search(r"[Уу]рок\s*(\d+)", title, re.I)
+    lesson_num = int(m.group(1)) if m else None
+    return {
+        "title": title,
+        "question": question,
+        "option1": option1,
+        "option2": option2,
+        "option3": option3,
+        "correct_num": correct_num,
+        "lesson_num": lesson_num,
+    }
 
-def _extract_text_from_message(data: dict) -> str:
-    """Достать текст из messageData (текст, расширенный текст, иначе — подпись к медиа или метка)."""
-    md = data.get("messageData") or {}
-    # Обычное текстовое сообщение
-    try:
-        t = md.get("textMessageData", {}) or {}
-        if isinstance(t.get("textMessage"), str):
-            return t["textMessage"]
-    except Exception:
-        pass
-    # Текст с ссылкой (extendedTextMessageData)
-    try:
-        e = md.get("extendedTextMessageData", {}) or {}
-        if isinstance(e.get("text"), str):
-            return e["text"]
-    except Exception:
-        pass
-    # Медиа с подписью
-    for key in ("imageMessageData", "videoMessageData", "documentMessageData", "audioMessageData"):
-        block = md.get(key) or {}
-        if isinstance(block.get("caption"), str):
-            return block["caption"]
-    # Реакция, стикер и т.д.
-    if md.get("reactionMessageData"):
-        return "[реакция]"
-    if md.get("stickerMessageData"):
-        return "[стикер]"
-    return "[медиа]"
 
-async def handle_webhook(request):
-    # Сразу отвечаем 200, чтобы Green API не повторял запрос
-    try:
-        body = await request.read()
-        print(f"--- WEBHOOK POST получен, размер тела: {len(body) if body else 0} ---")
-        sys.stdout.flush()
-        if not body:
-            return web.Response(text="OK", status=200)
+async def send_lesson_to_waiting_users(lesson_num: int) -> int:
+    """
+    Отправить урок всем активным пользователям, которые сейчас на этом уроке
+    (в т.ч. тем, кого допустили до появления видео). Возвращает кол-во отправленных.
+    """
+    lesson = await get_lesson(lesson_num)
+    if not lesson:
+        return 0
+    users = await get_active_users_for_lesson(lesson_num)
+    sent = 0
+    for row in users:
+        user_id = row["user_id"]
         try:
-            data = body.decode("utf-8") if isinstance(body, bytes) else body
-            if isinstance(data, str):
-                data = json.loads(data)
+            msg = await bot.send_video(
+                user_id,
+                video=lesson["file_id"],
+                caption=lesson["title"],
+                protect_content=True,
+            )
+            await save_video_sent(user_id, lesson_num, msg.message_id)
+            sent += 1
         except Exception as e:
-            print(f"--- WEBHOOK: не JSON, ошибка {e} ---")
-            return web.Response(text="OK", status=200)
-        print(f"--- ВХОДЯЩИЙ ЗАПРОС ИЗ WA: {data} ---")
-        sys.stdout.flush()
-        
-        type_wh = (data.get("typeWebhook") or "").strip()
-        if type_wh.lower() != "incomingmessagereceived":
-            print(f"--- WEBHOOK: пропуск, typeWebhook={type_wh} ---")
-            return web.Response(text="OK", status=200)
-        
-        if db is None or bot is None:
-            print("--- WEBHOOK: пропуск, БД или бот не инициализированы ---")
-            sys.stdout.flush()
-            return web.Response(text="OK", status=200)
-        
-        await _process_incoming_wa_message(data)
-    except Exception as e:
-        print(f"--- Ошибка в вебхуке: {e} ---")
-        traceback.print_exc()
-    
-    return web.Response(text="OK", status=200)
+            logger.warning("Не удалось отправить урок %s пользователю %s: %s", lesson_num, user_id, e)
+    return sent
 
-# --- ОТПРАВКА В WHATSAPP (GREEN API) ---
-async def send_whatsapp_message(chat_id: str, text: str) -> bool:
-    """Отправить текстовое сообщение в WhatsApp через Green API."""
-    chat_id_full = f"{chat_id}@c.us" if "@" not in chat_id else chat_id
-    url = f"{GREEN_URL}/waInstance{GREEN_ID}/sendMessage/{GREEN_TOKEN}"
-    payload = {"chatId": chat_id_full, "message": text}
-    try:
-        async with ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                return resp.status == 200
-    except Exception as e:
-        print(f"Ошибка отправки в WA: {e}")
-        return False
 
-# --- ХЕНДЛЕРЫ БОТА ---
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
-
+# --- Регистрация: Фамилия и Имя ---
 @dp.message(Command("start"))
-async def cmd_start(msg: Message, state: FSMContext):
-    await state.clear()
-    if is_owner(msg.from_user.id):
-        await msg.answer("Добро пожаловать! Выберите действие:", reply_markup=kb.main_owner_kb())
-        return
-    db.cur.execute("SELECT id, status FROM users WHERE id=?", (msg.from_user.id,))
-    row = db.cur.fetchone()
-    if row and row[1] == "active":
-        await msg.answer("Вы в системе. Ожидайте лидов — они будут приходить с кнопками «Ответить» и «Завершить».")
-        return
-    if row and row[1] == "pending":
-        await msg.answer("Ваша заявка на рассмотрении. Ожидайте решения владельца.")
-        return
-    await state.set_state(Form.waiting_for_fio)
-    await msg.answer("Введите ваше ФИО для регистрации менеджером:")
-
-@dp.message(Form.waiting_for_fio, F.text)
-async def process_fio(msg: Message, state: FSMContext):
-    fio = (msg.text or "").strip()
-    if not fio:
-        await msg.answer("Введите ФИО текстом.")
-        return
-    db.add_user(msg.from_user.id, fio, "manager")
-    db.set_user_status(msg.from_user.id, "pending")
-    await state.clear()
-    await msg.answer("Заявка отправлена. Ожидайте одобрения владельца.")
-    await bot.send_message(
-        OWNER_ID,
-        f"🆕 Заявка менеджера:\n👤 {fio}\n🆔 ID: {msg.from_user.id}",
-        reply_markup=kb.accept_manager_kb(msg.from_user.id)
-    )
-
-# --- ВЛАДЕЛЕЦ: СТАТИСТИКА И АНАЛИТИКА ---
-@dp.message(F.text == "📊 Статистика")
-async def owner_stats(msg: Message):
-    if not is_owner(msg.from_user.id):
-        return
-    count, total_paid, total_debt = db.get_stats() or (0, 0, 0)
-    total_paid = total_paid or 0
-    total_debt = total_debt or 0
-    await msg.answer(
-        f"📊 Статистика (всего):\n"
-        f"• Лидов: {count}\n"
-        f"• Сумма оплат: {total_paid:.2f}\n"
-        f"• Долг: {total_debt:.2f}"
-    )
-
-@dp.message(F.text == "📅 Аналитика")
-async def owner_analytics(msg: Message, state: FSMContext):
-    if not is_owner(msg.from_user.id):
-        return
-    await state.set_state(Form.analytics_period)
-    await msg.answer("Введите период в формате: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ\nНапример: 01.02.2025 - 28.02.2025")
-
-@dp.message(Form.analytics_period, F.text)
-async def process_analytics_period(msg: Message, state: FSMContext):
-    if not is_owner(msg.from_user.id):
-        return
-    text = (msg.text or "").strip()
-    try:
-        parts = text.split("-")
-        if len(parts) != 2:
-            raise ValueError("Нужен формат: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ")
-        d1 = datetime.strptime(parts[0].strip(), "%d.%m.%Y").strftime("%Y-%m-%d 00:00:00")
-        d2 = datetime.strptime(parts[1].strip(), "%d.%m.%Y").strftime("%Y-%m-%d 23:59:59")
-    except Exception:
-        await msg.answer("Неверный формат дат. Пример: 01.02.2025 - 28.02.2025")
-        return
-    await state.clear()
-    count, total_paid, total_debt = db.get_stats(d1, d2) or (0, 0, 0)
-    total_paid = total_paid or 0
-    total_debt = total_debt or 0
-    await msg.answer(
-        f"📅 Аналитика за период {parts[0].strip()} — {parts[1].strip()}:\n"
-        f"• Лидов: {count}\n"
-        f"• Оплачено: {total_paid:.2f}\n"
-        f"• Долг: {total_debt:.2f}"
-    )
-
-# --- ВЛАДЕЛЕЦ: ПРИХОД ---
-@dp.message(F.text == "💸 Приход")
-async def owner_pay(msg: Message, state: FSMContext):
-    if not is_owner(msg.from_user.id):
-        return
-    await state.clear()
-    leads = db.get_leads_in_progress()
-    keyboard = kb.leads_for_pay_kb(leads)
-    if not keyboard:
-        await msg.answer("Нет лидов в работе.")
-        return
-    await msg.answer("Выберите лид для записи прихода:", reply_markup=keyboard)
-
-@dp.callback_query(F.data.startswith("pay_lead_"))
-async def pay_lead_select(cb: CallbackQuery, state: FSMContext):
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    if cb.data == "pay_cancel":
+async def cmd_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    # Владелец: показываем кнопку «Статистика» и выходим
+    if user_id == ADMIN_ID:
         await state.clear()
-        await cb.message.edit_text("Отменено.")
-        await cb.answer()
+        await message.answer(
+            "Панель администратора. Нажмите кнопку ниже:",
+            reply_markup=admin_keyboard(),
+        )
         return
-    lead_id = int(cb.data.replace("pay_lead_", ""))
-    await state.set_state(Form.pay_lead_amount)
-    await state.update_data(lead_id=lead_id)
-    await cb.message.edit_text(f"Введите сумму прихода по лиду #{lead_id}:")
-    await cb.answer()
+    user = await get_user(user_id)
+    if user:
+        status = user["status"]
+        if status == "pending":
+            await message.answer("Ваша заявка на рассмотрении. Ожидайте решения администратора.")
+            return
+        if status == "rejected":
+            await message.answer("Ваша заявка была отклонена. Если есть вопросы — обратитесь к администратору.")
+            return
+        if status == "active":
+            await message.answer("Вы уже зарегистрированы. Продолжайте обучение.")
+            return
+    await state.set_state(RegStates.surname)
+    await message.answer("Добро пожаловать! Для доступа к урокам введите вашу <b>Фамилию</b>.", parse_mode="HTML")
 
-@dp.message(Form.pay_lead_amount, F.text)
-async def pay_lead_amount(msg: Message, state: FSMContext):
-    if not is_owner(msg.from_user.id):
+
+@dp.message(F.text, RegStates.surname)
+async def reg_surname(message: types.Message, state: FSMContext):
+    surname = (message.text or "").strip()
+    if not surname:
+        await message.answer("Введите фамилию текстом.")
         return
-    try:
-        amount = float((msg.text or "").replace(",", ".").strip())
-        if amount <= 0:
-            raise ValueError("Сумма должна быть больше 0")
-    except ValueError:
-        await msg.answer("Введите число, например: 5000 или 5000.50")
+    await state.update_data(reg_surname=surname)
+    await state.set_state(RegStates.name)
+    await message.answer("Теперь введите ваше <b>Имя</b>.", parse_mode="HTML")
+
+
+@dp.message(F.text, RegStates.name)
+async def reg_name(message: types.Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Введите имя текстом.")
         return
     data = await state.get_data()
-    lead_id = data.get("lead_id")
+    surname = data.get("reg_surname", "")
     await state.clear()
-    if db.add_payment_to_lead(lead_id, amount):
-        await msg.answer(f"✅ Приход {amount:.2f} записан по лиду #{lead_id}.")
-    else:
-        await msg.answer("Ошибка: лид не найден.")
-
-# --- ВЛАДЕЛЕЦ: УВОЛИТЬ ---
-@dp.message(F.text == "🚫 Уволить")
-async def owner_fire(msg: Message, state: FSMContext):
-    if not is_owner(msg.from_user.id):
-        return
-    await state.clear()
-    managers = db.get_active_managers()
-    keyboard = kb.managers_to_fire_kb(managers)
-    if not keyboard:
-        await msg.answer("Нет активных менеджеров.")
-        return
-    await msg.answer("Выберите менеджера для увольнения:", reply_markup=keyboard)
-
-@dp.callback_query(F.data.startswith("fire_"))
-async def fire_manager_cb(cb: CallbackQuery, state: FSMContext):
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    if cb.data == "fire_cancel":
-        await cb.message.edit_text("Отменено.")
-        await cb.answer()
-        return
-    if cb.data.startswith("fire_confirm_"):
-        user_id = int(cb.data.replace("fire_confirm_", ""))
-        db.set_user_status(user_id, "fired")
-        await cb.message.edit_text("Менеджер уволен.")
-        try:
-            await bot.send_message(user_id, "Вам прекращён доступ в CRM.")
-        except Exception:
-            pass
-        await cb.answer()
-        return
-    user_id = int(cb.data.replace("fire_", ""))
-    await cb.message.edit_text("Подтвердите увольнение:", reply_markup=kb.confirm_fire_kb(user_id))
-    await cb.answer()
-
-# --- ВЛАДЕЛЕЦ: СКАЧАТЬ АРХИВ ---
-@dp.message(F.text == "📁 Скачать Архив")
-async def owner_archive(msg: Message):
-    if not is_owner(msg.from_user.id):
-        return
-    rows = db.get_all_leads_for_export()
-    if not rows:
-        await msg.answer("Нет данных для выгрузки.")
-        return
-    df = pd.DataFrame(rows, columns=[
-        "id", "client_phone", "manager_id", "status", "total_price", "paid_amount", "debt", "reject_reason", "created_at"
+    await add_user_pending(message.from_user.id, surname, name)
+    full_name = f"{surname} {name}"
+    await message.answer(
+        f"Спасибо, {full_name}! Ваша заявка отправлена на проверку. Вы получите уведомление после одобрения."
+    )
+    # Уведомление админу с кнопками Допустить / Отклонить
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Допустить", callback_data=f"mod_allow_{message.from_user.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_reject_{message.from_user.id}"),
+        ]
     ])
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    os.close(fd)
-    df.to_excel(path, index=False)
-    await msg.answer_document(FSInputFile(path), caption="Архив лидов")
+    await bot.send_message(
+        ADMIN_ID,
+        f"Новая заявка: <b>{full_name}</b> (id: {message.from_user.id})",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+# --- Модерация заявок ---
+@dp.callback_query(F.data.startswith("mod_allow_"))
+async def mod_allow(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer("Доступ запрещён.", show_alert=True)
+        return
+    user_id = int(cb.data.replace("mod_allow_", ""))
+    await set_user_status(user_id, "active")
+    user = await get_user(user_id)
+    full_name = f"{user['surname']} {user['name']}"
+    await cb.message.edit_text(f"✅ Заявка одобрена: {full_name}")
+    await cb.answer()
+
+    # Приветствие и Урок 1
     try:
-        os.remove(path)
+        interval_text = "1 минуту" if QUIZ_AFTER_MINUTES == 1 else f"{QUIZ_AFTER_MINUTES // 60} ч"
+        await bot.send_message(
+            user_id,
+            f"Поздравляем! Вам открыт доступ к урокам. Ниже первое видео — через {interval_text} оно исчезнет и вам будет задан вопрос по материалу.",
+        )
+        lesson = await get_lesson(1)
+        if lesson:
+            msg = await bot.send_video(
+                user_id,
+                video=lesson["file_id"],
+                caption=lesson["title"],
+                protect_content=True,
+            )
+            await save_video_sent(user_id, 1, msg.message_id)
+        else:
+            await bot.send_message(user_id, "Урок 1 пока не добавлен. Ожидайте.")
+    except Exception as e:
+        logger.exception("Ошибка отправки приветствия/урока 1: %s", e)
+        await bot.send_message(ADMIN_ID, f"Не удалось отправить урок 1 пользователю {user_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("mod_reject_"))
+async def mod_reject(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer("Доступ запрещён.", show_alert=True)
+        return
+    user_id = int(cb.data.replace("mod_reject_", ""))
+    await set_user_status(user_id, "rejected")
+    user = await get_user(user_id)
+    full_name = f"{user['surname']} {user['name']}"
+    await cb.message.edit_text(f"❌ Заявка отклонена: {full_name}")
+    await cb.answer()
+    try:
+        await bot.send_message(user_id, "К сожалению, ваша заявка была отклонена.")
     except Exception:
         pass
 
-# --- CALLBACK: ОТВЕТИТЬ ЛИДУ (ОТПРАВКА В WA) ---
-@dp.callback_query(F.data.startswith("reply_"))
-async def reply_lead(cb: CallbackQuery, state: FSMContext):
-    client_phone = cb.data.replace("reply_", "")
-    await state.set_state(Form.writing_answer)
-    await state.update_data(client_phone=client_phone)
-    await cb.message.answer("Введите сообщение для клиента (оно будет отправлено в WhatsApp):")
-    await cb.answer()
 
-@dp.message(Form.writing_answer, F.text)
-async def send_reply_to_wa(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    client_phone = data.get("client_phone")
-    await state.clear()
-    if not client_phone:
-        await msg.answer("Сессия сброшена. Нажмите «Ответить» у нужного лида снова.")
+# --- Сообщения из группы-архива: парсим урок и сохраняем ---
+@dp.message(F.chat.id == ARCHIVE_GROUP_ID, F.video, F.caption)
+async def on_archive_video(message: types.Message):
+    caption = message.caption
+    parsed = parse_lesson_caption(caption)
+    if not parsed:
         return
-    ok = await send_whatsapp_message(client_phone, msg.text)
-    if ok:
-        await msg.answer("✅ Сообщение отправлено в WhatsApp.")
+    lesson_num = parsed["lesson_num"] or await get_next_lesson_num()
+    file_id = message.video.file_id
+    await save_lesson(
+        lesson_num,
+        file_id,
+        parsed["title"],
+        parsed["question"],
+        parsed["option1"],
+        parsed["option2"],
+        parsed["option3"],
+        parsed["correct_num"],
+    )
+    logger.info("Сохранён урок %s: %s", lesson_num, parsed["title"])
+    # Кто уже допущен и ждёт этот урок — сразу получают видео
+    sent = await send_lesson_to_waiting_users(lesson_num)
+    if sent:
+        logger.info("Урок %s отправлен %s пользователям", lesson_num, sent)
+
+
+# --- Админ переслал сообщение из группы в ЛС — тоже парсим и сохраняем урок ---
+@dp.message(F.chat.id == ADMIN_ID, F.video, F.caption)
+async def on_admin_forwarded_archive(message: types.Message):
+    # Откуда переслано: forward_origin.sender_chat.id (группа/канал) или forward_origin.chat.id
+    origin = getattr(message, "forward_origin", None)
+    if not origin:
+        return
+    chat_id = getattr(getattr(origin, "sender_chat", None), "id", None) or getattr(getattr(origin, "chat", None), "id", None)
+    if chat_id != ARCHIVE_GROUP_ID:
+        return
+    caption = message.caption
+    parsed = parse_lesson_caption(caption)
+    if not parsed:
+        await message.reply("Неверный формат подписи. Нужно: Заголовок | Вопрос | Вариант1, Вариант2, Вариант3 | 1-3")
+        return
+    lesson_num = parsed["lesson_num"] or await get_next_lesson_num()
+    file_id = message.video.file_id
+    await save_lesson(
+        lesson_num,
+        file_id,
+        parsed["title"],
+        parsed["question"],
+        parsed["option1"],
+        parsed["option2"],
+        parsed["option3"],
+        parsed["correct_num"],
+    )
+    await message.reply(f"Урок {lesson_num} сохранён: {parsed['title']}")
+    # Кто уже допущен и ждёт этот урок — сразу получают видео
+    sent = await send_lesson_to_waiting_users(lesson_num)
+    if sent:
+        await message.reply(f"Видео отправлено {sent} пользователям, которые ждали этот урок.")
+
+
+# --- Админ: /admin или кнопка «Статистика» ---
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await _send_admin_panel(message)
+
+
+@dp.message(F.text == "📊 Статистика", F.from_user.id == ADMIN_ID)
+async def admin_btn_statistics(message: types.Message):
+    await _send_admin_panel(message)
+
+
+async def _send_admin_panel(message: types.Message):
+    """Показать админу инлайн-кнопки: Статистика по урокам, Список пользователей."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика по урокам", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_list")],
+    ])
+    await message.answer("Выберите:", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer()
+        return
+    rows = await get_stats_by_lesson()
+    if not rows:
+        text = "Нет активных учеников по урокам."
     else:
-        await msg.answer("❌ Не удалось отправить. Проверьте Green API.")
-
-# --- CALLBACK: ЗАВЕРШИТЬ СДЕЛКУ ---
-@dp.callback_query(F.data.startswith("finish_"))
-async def finish_lead(cb: CallbackQuery, state: FSMContext):
-    if cb.data == "finish_cancel":
-        await state.clear()
-        await cb.message.edit_text("Отменено.")
-        await cb.answer()
-        return
-    if cb.data.startswith("finish_ok_"):
-        client_phone = cb.data.replace("finish_ok_", "")
-        row = db.get_lead_by_phone_manager(client_phone, cb.from_user.id)
-        if not row:
-            await cb.answer("Лид не найден или уже закрыт.", show_alert=True)
-            return
-        lead_id = row[0]
-        await state.set_state(Form.finish_paid_total)
-        await state.update_data(lead_id=lead_id, client_phone=client_phone)
-        await cb.message.answer("Введите сумму сделки (итого):")
-        await cb.answer()
-        return
-    if cb.data.startswith("finish_no_"):
-        client_phone = cb.data.replace("finish_no_", "")
-        row = db.get_lead_by_phone_manager(client_phone, cb.from_user.id)
-        if not row:
-            await cb.answer("Лид не найден или уже закрыт.", show_alert=True)
-            return
-        lead_id = row[0]
-        await state.set_state(Form.finish_reject)
-        await state.update_data(lead_id=lead_id)
-        await cb.message.answer("Введите причину отказа:")
-        await cb.answer()
-        return
-    # finish_{phone} — показать выбор Успешно/Отказ
-    client_phone = cb.data.replace("finish_", "")
-    await cb.message.edit_reply_markup(reply_markup=kb.finish_choice_kb(client_phone))
+        lines = ["<b>Статистика в реальном времени</b>\n"]
+        for r in rows:
+            lines.append(f"Урок {r['lesson_num']}: {r['cnt']} чел.")
+        text = "\n".join(lines)
+    await cb.message.edit_text(text, parse_mode="HTML")
     await cb.answer()
 
-@dp.message(Form.finish_paid_total, F.text)
-async def finish_total_entered(msg: Message, state: FSMContext):
-    try:
-        total = float((msg.text or "").replace(",", ".").strip())
-        if total < 0:
-            raise ValueError("Сумма не может быть отрицательной")
-    except ValueError:
-        await msg.answer("Введите число, например: 10000")
-        return
-    await state.update_data(total=total)
-    await state.set_state(Form.finish_paid_amount)
-    await msg.answer("Введите оплаченную сумму:")
 
-@dp.message(Form.finish_paid_amount, F.text)
-async def finish_paid_entered(msg: Message, state: FSMContext):
-    try:
-        paid = float((msg.text or "").replace(",", ".").strip())
-        if paid < 0:
-            raise ValueError("Сумма не может быть отрицательной")
-    except ValueError:
-        await msg.answer("Введите число, например: 5000")
+@dp.callback_query(F.data == "admin_list")
+async def admin_list(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer()
         return
-    data = await state.get_data()
-    lead_id = data.get("lead_id")
-    total = data.get("total", 0)
-    await state.clear()
-    if lead_id:
-        db.close_lead(lead_id, "done", total=total, paid=paid)
-        await msg.answer(f"✅ Сделка закрыта. Итого: {total}, Оплачено: {paid}, Долг: {total - paid:.2f}")
+    rows = await get_all_users()
+    if not rows:
+        text = "Нет пользователей."
     else:
-        await msg.answer("Ошибка: данные сессии потеряны.")
+        lines = ["<b>Список пользователей</b>\n"]
+        for r in rows:
+            status_ru = {"pending": "⏳ на модерации", "active": "✅ активен", "rejected": "❌ отклонён"}.get(r["status"], r["status"])
+            lines.append(f"• {r['surname']} {r['name']} — {status_ru}, урок {r['current_lesson']} (id: {r['user_id']})")
+        text = "\n".join(lines)
+    await cb.message.edit_text(text, parse_mode="HTML")
+    await cb.answer()
 
-@dp.message(Form.finish_reject, F.text)
-async def finish_reject_entered(msg: Message, state: FSMContext):
-    reason = (msg.text or "").strip() or "Не указана"
-    data = await state.get_data()
-    lead_id = data.get("lead_id")
-    await state.clear()
-    if lead_id:
-        db.close_lead(lead_id, "rejected", reason=reason)
-        await msg.answer("✅ Лид закрыт как отказ.")
+
+# --- Фоновая задача: через 24ч удалить видео и отправить викторину ---
+async def job_24h():
+    due = await get_due_video_sends()
+    for row in due:
+        record_id, user_id, lesson_num, message_id = row["id"], row["user_id"], row["lesson_num"], row["message_id"]
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=message_id)
+        except Exception as e:
+            logger.warning("Не удалось удалить сообщение %s у %s: %s", message_id, user_id, e)
+        await delete_video_sent_record(record_id)
+
+        lesson = await get_lesson(lesson_num)
+        if not lesson:
+            await bot.send_message(user_id, "Ошибка: урок не найден. Обратитесь к администратору.")
+            continue
+
+        # Викторина: три кнопки с вариантами ответа
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=lesson["option1"], callback_data=f"quiz_ans_{user_id}_{lesson_num}_1")],
+            [InlineKeyboardButton(text=lesson["option2"], callback_data=f"quiz_ans_{user_id}_{lesson_num}_2")],
+            [InlineKeyboardButton(text=lesson["option3"], callback_data=f"quiz_ans_{user_id}_{lesson_num}_3")],
+        ])
+        await bot.send_message(
+            user_id,
+            f"<b>{lesson['title']}</b>\n\n{lesson['question']}",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+    await asyncio.sleep(0)
+
+
+# --- Ответ на викторину ---
+@dp.callback_query(F.data.startswith("quiz_ans_"))
+async def quiz_answer(cb: CallbackQuery):
+    parts = cb.data.replace("quiz_ans_", "").split("_")
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    user_id, lesson_num, choice = int(parts[0]), int(parts[1]), int(parts[2])
+    if cb.from_user.id != user_id:
+        await cb.answer("Это не ваш вопрос.", show_alert=True)
+        return
+
+    lesson = await get_lesson(lesson_num)
+    if not lesson:
+        await cb.answer("Ошибка данных.")
+        return
+
+    correct = lesson["correct_num"]
+    await cb.message.edit_reply_markup(reply_markup=None)
+
+    if choice == correct:
+        await cb.message.answer("Поздравляем! Ответ верный. Отправляем следующий урок.")
+        await advance_user_lesson(user_id)
+        user = await get_user(user_id)
+        next_num = user["current_lesson"]
+        next_lesson = await get_lesson(next_num)
+        if next_lesson:
+            msg = await bot.send_video(
+                user_id,
+                video=next_lesson["file_id"],
+                caption=next_lesson["title"],
+                protect_content=True,
+            )
+            await save_video_sent(user_id, next_num, msg.message_id)
+        else:
+            await bot.send_message(user_id, "Курс пройден! Новых уроков пока нет.")
     else:
-        await msg.answer("Ошибка: данные сессии потеряны.")
+        await cb.message.answer("Нужно повторить материал! Отправляем то же видео ещё на 24 часа.")
+        msg = await bot.send_video(
+            user_id,
+            video=lesson["file_id"],
+            caption=lesson["title"],
+            protect_content=True,
+        )
+        await save_video_sent(user_id, lesson_num, msg.message_id)
 
-# --- CALLBACK: ПРИНЯТЬ / ОТКЛОНИТЬ МЕНЕДЖЕРА ---
-@dp.callback_query(F.data.startswith("accept_"))
-async def accept_manager(cb: CallbackQuery):
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    user_id = int(cb.data.replace("accept_", ""))
-    db.set_user_status(user_id, "active")
-    await cb.message.edit_text(f"✅ Менеджер {user_id} принят.")
-    try:
-        await bot.send_message(user_id, "Вас приняли в CRM. Ожидайте лидов.")
-    except Exception:
-        pass
     await cb.answer()
 
-@dp.callback_query(F.data.startswith("decline_"))
-async def decline_manager(cb: CallbackQuery):
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    user_id = int(cb.data.replace("decline_", ""))
-    db.set_user_status(user_id, "declined")
-    await cb.message.edit_text(f"❌ Заявка менеджера {user_id} отклонена.")
-    try:
-        await bot.send_message(user_id, "К сожалению, ваша заявка отклонена.")
-    except Exception:
-        pass
-    await cb.answer()
 
-# --- ОТМЕНА ЛЮБОГО FSM ---
-@dp.callback_query(F.data == "cancel_state")
-async def cancel_state(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.answer("Отменено")
-    try:
-        await cb.message.edit_text("Действие отменено.")
-    except Exception:
-        await cb.message.answer("Действие отменено.")
-
-# --- ИСПРАВЛЕННЫЙ БЛОК ЗАПУСКА ---
-async def start_bot():
-    await dp.start_polling(bot)
-
+# --- Точка входа ---
 async def main():
-    global bot, db, _green_session
-    print("CRM ИНОЯТА: запуск приложения...")
-    sys.stdout.flush()
-    
+    await init_db()
+    scheduler.add_job(job_24h, "interval", minutes=1)
+    scheduler.start()
     try:
-        db = Database("/data/marketing_crm.db")
-        print("БД инициализирована: /data/marketing_crm.db")
-    except Exception as e:
-        print(f"Ошибка БД: {e}")
-        traceback.print_exc()
-        db = None
-    sys.stdout.flush()
-    
-    try:
-        bot = Bot(token=TOKEN)
-        print("Бот инициализирован")
-    except Exception as e:
-        print(f"Ошибка бота: {e}")
-        traceback.print_exc()
-        bot = None
-    sys.stdout.flush()
-    
-    _green_session = ClientSession()
-    # Проверка настроек инстанса Green API (webhookUrl должен быть пустым для опроса)
-    try:
-        url = f"{GREEN_URL}/waInstance{GREEN_ID}/getSettings/{GREEN_TOKEN}"
-        async with _green_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                data = await r.json()
-                webhook = (data.get("webhookUrl") or "").strip()
-                inc = data.get("incomingWebhook", "?")
-                print(f"--- Green API getSettings: webhookUrl={webhook!r}, incomingWebhook={inc} ---")
-            else:
-                print(f"--- Green API getSettings: HTTP {r.status} ---")
-    except Exception as e:
-        print(f"--- Green API getSettings: {e} ---")
-    sys.stdout.flush()
-    asyncio.create_task(check_wa_polling())
-    print("Опрос Green API (receiveNotification) запущен — сообщения из WA будут приходить без вебхука.")
-    sys.stdout.flush()
-    
-    app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="CRM ИНОЯТА OK"))
-    app.router.add_get("/ping", lambda r: web.Response(text="pong"))
-    app.router.add_post("/webhook", handle_webhook)
-    app.router.add_get("/webhook", lambda r: web.Response(text="Webhook is working! Send POST request."))
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 80))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Веб-сервер запущен на порту {port}. Путь: /webhook")
-    sys.stdout.flush()
-    
-    if bot:
-        await start_bot()
-    else:
-        print("Бот не запущен — работают только вебхуки. Ожидание...")
-        await asyncio.Event().wait()
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown()
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    asyncio.run(main())
