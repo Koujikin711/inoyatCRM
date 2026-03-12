@@ -125,12 +125,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     # Владелец: показываем кнопку «Статистика» и выходим
     if user_id == ADMIN_ID:
+        logger.info("cmd_start: user_id=%s совпадает с ADMIN_ID -> панель админа", user_id)
         await state.clear()
         await message.answer(
             "Панель администратора. Нажмите кнопку ниже:",
             reply_markup=admin_keyboard(),
         )
         return
+    logger.info("cmd_start: user_id=%s, ADMIN_ID=%s -> не админ, запрашиваем ФИО", user_id, ADMIN_ID)
     user = await get_user(user_id)
     if user:
         status = user["status"]
