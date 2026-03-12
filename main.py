@@ -125,6 +125,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     # Владелец: показываем кнопку «Статистика» и выходим
     if user_id == ADMIN_ID:
+        print(f"[INOYAT_CRM] cmd_start: user_id={user_id} == ADMIN_ID -> панель админа")
         logger.info("cmd_start: user_id=%s совпадает с ADMIN_ID -> панель админа", user_id)
         await state.clear()
         await message.answer(
@@ -132,6 +133,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             reply_markup=admin_keyboard(),
         )
         return
+    print(f"[INOYAT_CRM] cmd_start: user_id={user_id}, ADMIN_ID={ADMIN_ID} -> не админ, запрашиваем ФИО")
     logger.info("cmd_start: user_id=%s, ADMIN_ID=%s -> не админ, запрашиваем ФИО", user_id, ADMIN_ID)
     user = await get_user(user_id)
     if user:
@@ -446,7 +448,9 @@ async def quiz_answer(cb: CallbackQuery):
 # --- Точка входа ---
 async def main():
     await init_db()
-    logger.info("ADMIN_ID=%s (владелец получает заявки и /admin)", ADMIN_ID)
+    msg = f"[INOYAT_CRM] ADMIN_ID={ADMIN_ID} (владелец получает заявки и /admin)"
+    logger.info(msg)
+    print(msg)
     scheduler.add_job(job_24h, "interval", minutes=1)
     scheduler.start()
     try:
